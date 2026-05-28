@@ -3,6 +3,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from langchain_google_genai import ChatGoogleGenerativeAI
+from datetime import date, datetime
 import os
 import traceback
 
@@ -17,6 +18,21 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 GEMINI_MODEL = "gemini-2.5-flash"
 mongo_client = None
+
+MONTH_NAMES_ID = {
+    1: "Januari",
+    2: "Februari",
+    3: "Maret",
+    4: "April",
+    5: "Mei",
+    6: "Juni",
+    7: "Juli",
+    8: "Agustus",
+    9: "September",
+    10: "Oktober",
+    11: "November",
+    12: "Desember"
+}
 
 
 def get_db():
@@ -196,6 +212,123 @@ def get_first_number(data, keys):
     return None
 
 
+def parse_prediction_date(value):
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+
+    if not value:
+        return None
+
+    date_text = str(value).strip()
+
+    for date_format in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(date_text[:10], date_format)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(date_text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_prediction_date(value):
+    parsed_date = parse_prediction_date(value)
+
+    if not parsed_date:
+        raw_value = str(value) if value else None
+        return {
+            "date_label": raw_value,
+            "period_label": raw_value,
+            "iso_date": raw_value
+        }
+
+    month_name = MONTH_NAMES_ID.get(parsed_date.month, parsed_date.strftime("%B"))
+
+    return {
+        "date_label": f"{parsed_date.day} {month_name} {parsed_date.year}",
+        "period_label": f"{month_name} {parsed_date.year}",
+        "iso_date": parsed_date.strftime("%Y-%m-%d")
+    }
+
+
+def get_latest_prediction_period():
+    db = get_db()
+
+    latest_prediction = db["prediction_results"].find_one(
+        {},
+        {"_id": 0, "tanggal": 1, "updated_at": 1},
+        sort=[("tanggal", -1)]
+    )
+
+    if not latest_prediction or not latest_prediction.get("tanggal"):
+        return {
+            "latest_prediction_date": None,
+            "date_label": None,
+            "period_label": None,
+            "total_predictions_on_date": 0,
+            "total_prediction_on_date": 0
+        }
+
+    latest_date = latest_prediction.get("tanggal")
+    formatted_date = format_prediction_date(latest_date)
+
+    prediction_pipeline = [
+        {"$match": {"tanggal": latest_date}},
+        {
+            "$group": {
+                "_id": "$tanggal",
+                "total_predictions_on_date": {"$sum": 1},
+                "total_prediction_on_date": {"$sum": "$predicted_sales"}
+            }
+        }
+    ]
+
+    prediction_result = list(db["prediction_results"].aggregate(prediction_pipeline))
+    prediction_summary = prediction_result[0] if prediction_result else {}
+
+    return {
+        "latest_prediction_date": latest_date,
+        "date_label": formatted_date["date_label"],
+        "period_label": formatted_date["period_label"],
+        "iso_date": formatted_date["iso_date"],
+        "total_predictions_on_date": prediction_summary.get("total_predictions_on_date", 0),
+        "total_prediction_on_date": prediction_summary.get("total_prediction_on_date", 0),
+        "last_updated_at": latest_prediction.get("updated_at")
+    }
+
+
+def get_latest_sale_period():
+    db = get_db()
+
+    latest_sale = db["penjualans"].find_one(
+        {},
+        {"_id": 0, "tanggal": 1},
+        sort=[("tanggal", -1)]
+    )
+
+    if not latest_sale or not latest_sale.get("tanggal"):
+        return {
+            "latest_sale_date": None,
+            "sale_date_label": None,
+            "sale_period_label": None
+        }
+
+    latest_date = latest_sale.get("tanggal")
+    formatted_date = format_prediction_date(latest_date)
+
+    return {
+        "latest_sale_date": latest_date,
+        "sale_date_label": formatted_date["date_label"],
+        "sale_period_label": formatted_date["period_label"],
+        "sale_iso_date": formatted_date["iso_date"]
+    }
+
+
 def get_top_prediction_products():
     db = get_db()
 
@@ -239,13 +372,88 @@ def get_model_explanation():
         "algorithm": "Multiple Linear Regression",
         "features": ["harga", "promo", "weekday", "month"],
         "target": "jumlah",
+        "developer": "Mas Kafi dan Tim",
         "training_strategy": "Model dilatih per produk agar prediksi lebih spesifik untuk setiap jenis bunga.",
-        "data_source": "MongoDB Atlas database prediksi_bunga"
+        "evaluation_metrics": ["MAE", "RMSE", "R2"],
+        "data_source": "MongoDB Atlas database prediksi_bunga",
+        "main_reason": (
+            "Aplikasi Web FloraPredict memprediksi jumlah penjualan dalam bentuk angka. "
+            "Penjualan dipengaruhi beberapa fitur input seperti harga, promo, weekday, dan month. "
+            "Multiple Linear Regression sesuai karena dapat memodelkan hubungan beberapa variabel input "
+            "terhadap satu target numerik."
+        ),
+        "simple_linear_reason": (
+            "Linear Regression biasa umumnya hanya memakai satu variabel input, sedangkan data sistem ini "
+            "menggunakan beberapa variabel input seperti harga, promo, weekday, dan month."
+        ),
+        "complex_model_reason": (
+            "Fokus proyek adalah membuat sistem prediksi yang jelas alurnya, mudah dijelaskan, dan sesuai "
+            "dengan data yang tersedia. Multiple Linear Regression cukup untuk baseline prediksi, mudah "
+            "dievaluasi, dan stabil diintegrasikan ke Laravel, Flask, MongoDB, dan Flutter."
+        )
     }
 
 
 def detect_intent(message):
     text = message.lower().strip()
+
+    creator_keywords = [
+        "siapa pencipta",
+        "siapa pembuat",
+        "siapa yang membuat",
+        "dibuat oleh siapa",
+        "pembuat ai",
+        "pencipta ai",
+        "creator ai",
+        "siapa developer",
+        "developer ai",
+        "siapa pengembang",
+        "pengembang ai",
+        "author ai"
+    ]
+
+    if any(keyword in text for keyword in creator_keywords) and any(keyword in text for keyword in ["flora", "florapredict", "flora predict", "ai"]):
+        return "creator_info"
+
+    reason_keywords = ["kenapa", "mengapa", "kok", "padahal"]
+    latest_reference_keywords = [
+        "data terakhir",
+        "terakhirnya",
+        "31 januari",
+        "januari 2024",
+        "tanggal sekarang",
+        "sekarang",
+        "hari ini",
+        "tahun 2026",
+        "bulan 5",
+        "mei 2026"
+    ]
+
+    if any(keyword in text for keyword in reason_keywords) and any(keyword in text for keyword in latest_reference_keywords):
+        return "latest_prediction_reason"
+
+    latest_prediction_keywords = [
+        "tanggal prediksi terakhir",
+        "prediksi terakhir tanggal",
+        "prediksi terbaru tanggal",
+        "data terakhir yang diprediksi",
+        "data terakhir diprediksi",
+        "terakhir yang diprediksi",
+        "terakhir diprediksi",
+        "hasil prediksi terakhir",
+        "hasil prediksi terbaru",
+        "periode prediksi terakhir",
+        "periode prediksi terbaru",
+        "prediksi terakhir",
+        "prediksi terbaru",
+        "last prediction"
+    ]
+
+    if any(keyword in text for keyword in latest_prediction_keywords):
+        return "latest_prediction_date"
+
+    if any(keyword in text for keyword in ["prediksi", "diprediksi", "hasil prediksi"]) and any(keyword in text for keyword in ["terakhir", "terbaru", "tanggal", "bulan", "tahun", "periode"]):
+        return "latest_prediction_date"
 
     if any(keyword in text for keyword in ["ringkasan", "dashboard", "total", "jumlah data", "summary"]):
         return "dashboard_summary"
@@ -275,13 +483,34 @@ def detect_intent(message):
     if any(keyword in text for keyword in ["prediksi tertinggi", "paling tinggi", "tertinggi", "produk tertinggi"]):
         return "top_prediction"
 
-    if any(keyword in text for keyword in ["model", "algoritma", "multiple linear regression", "linear regression", "fitur", "target", "variabel"]):
+    if any(keyword in text for keyword in ["linear regression biasa", "linear regression sederhana", "simple linear regression"]) or (
+        "linear regression" in text and any(keyword in text for keyword in ["bukan", "kenapa bukan", "mengapa bukan", "beda", "bedanya", "biasa"])
+    ):
+        return "why_not_simple_linear_regression"
+
+    if any(keyword in text for keyword in ["model yang lebih kompleks", "model lebih kompleks", "model kompleks", "model yang lebih canggih", "model lebih canggih"]) or (
+        any(keyword in text for keyword in ["random forest", "svm", "xgboost", "lstm", "neural network", "deep learning"]) and any(keyword in text for keyword in ["kenapa", "mengapa", "pakai", "tidak"])
+    ):
+        return "why_not_complex_model"
+
+    if any(keyword in text for keyword in ["model", "metode", "algoritma", "multiple linear regression", "linear regression", "fitur", "target", "variabel", "mae", "rmse", "r2", "r²"]):
         return "model_explanation"
 
     return "general"
 
 
 def build_context_by_intent(intent):
+    if intent == "creator_info":
+        data = {
+            "creator_name": "Akhmad Kafi Rizal",
+            "creator_nickname": "Mas Kahfi",
+            "project": "AI FloraPredict"
+        }
+
+        manual_answer = "Pencipta AI FloraPredict ini adalah Akhmad Kafi Rizal, yang biasa dipanggil Mas Kahfi."
+
+        return data, manual_answer
+
     if intent == "dashboard_summary":
         data = get_dashboard_summary()
 
@@ -294,6 +523,57 @@ def build_context_by_intent(intent):
 
         if data.get("latest_prediction_date"):
             manual_answer += f" Periode prediksi terbaru adalah {data['latest_prediction_date']}."
+
+        return data, manual_answer
+
+    if intent == "latest_prediction_date":
+        data = get_latest_prediction_period()
+
+        if not data.get("latest_prediction_date"):
+            manual_answer = "Data prediksi terbaru belum tersedia. Jalankan generate prediksi terlebih dahulu."
+        else:
+            manual_answer = (
+                f"Data prediksi terakhir tersedia untuk tanggal {data['date_label']} "
+                f"(periode {data['period_label']})."
+            )
+
+            if data.get("total_predictions_on_date"):
+                manual_answer += (
+                    f" Pada periode tersebut terdapat {data['total_predictions_on_date']} data produk "
+                    f"dengan total prediksi {int(data.get('total_prediction_on_date', 0))} tangkai."
+                )
+
+        return data, manual_answer
+
+    if intent == "latest_prediction_reason":
+        data = get_latest_prediction_period()
+        sale_data = get_latest_sale_period()
+        data.update(sale_data)
+
+        if not data.get("latest_prediction_date"):
+            manual_answer = (
+                "Karena hasil prediksi belum tersedia di database. "
+                "Tanggal hari ini tidak otomatis membuat data prediksi baru. "
+                "Jalankan generate prediksi terlebih dahulu agar periode prediksi tersimpan."
+            )
+        else:
+            manual_answer = (
+                f"Karena yang saya baca adalah hasil prediksi yang sudah tersimpan, bukan tanggal hari ini. "
+                f"Hasil prediksi terbaru yang tersimpan masih tanggal {data['date_label']} "
+                f"(periode {data['period_label']}). "
+                "Tanggal sekarang tidak otomatis membuat prediksi baru."
+            )
+
+            if data.get("sale_date_label"):
+                manual_answer += (
+                    f" Data penjualan terakhir tercatat sampai {data['sale_date_label']}, "
+                    "tetapi hasil prediksi terbaru tetap mengikuti data yang terakhir digenerate."
+                )
+
+            manual_answer += (
+                " Kalau ingin periode 2026 muncul sebagai prediksi terbaru, jalankan Generate Prediksi "
+                "untuk periode tersebut terlebih dahulu."
+            )
 
         return data, manual_answer
 
@@ -344,9 +624,33 @@ def build_context_by_intent(intent):
         data = get_model_explanation()
 
         manual_answer = (
-            "Sistem ini menggunakan Multiple Linear Regression untuk memprediksi jumlah penjualan bunga. "
-            "Model dilatih per produk dengan fitur harga, promo, weekday, dan month. "
-            "Target yang diprediksi adalah jumlah penjualan."
+            "Aplikasi Web FloraPredict yang dikembangkan oleh Mas Kafi dan Tim menggunakan Multiple Linear Regression. "
+            "Alasannya, sistem ini memprediksi jumlah penjualan dalam bentuk angka, dan penjualan dipengaruhi beberapa fitur "
+            "seperti harga, promo, weekday, dan month. Multiple Linear Regression cocok karena bisa memodelkan hubungan "
+            "beberapa variabel input terhadap satu target numerik. Model ini juga mudah dijelaskan, dievaluasi dengan "
+            "MAE/RMSE/R², dan di sistem ini dilatih per produk agar hasil prediksinya lebih spesifik."
+        )
+
+        return data, manual_answer
+
+    if intent == "why_not_simple_linear_regression":
+        data = get_model_explanation()
+
+        manual_answer = (
+            "Karena Linear Regression biasa umumnya hanya memakai satu variabel input, sedangkan data FloraPredict "
+            "memakai beberapa variabel input, yaitu harga, promo, weekday, dan month. Jadi metode yang lebih sesuai "
+            "adalah Multiple Linear Regression."
+        )
+
+        return data, manual_answer
+
+    if intent == "why_not_complex_model":
+        data = get_model_explanation()
+
+        manual_answer = (
+            "Karena fokus proyek yang dikembangkan oleh Mas Kafi dan Tim adalah membuat sistem prediksi yang jelas alurnya, "
+            "mudah dijelaskan, dan sesuai dengan data yang tersedia. Multiple Linear Regression sudah cukup untuk baseline "
+            "prediksi, mudah dievaluasi, dan hasilnya bisa diintegrasikan ke Laravel, Flask, MongoDB, dan Flutter dengan stabil."
         )
 
         return data, manual_answer
@@ -355,8 +659,10 @@ def build_context_by_intent(intent):
         "capabilities": [
             "Menjawab ringkasan dashboard",
             "Menampilkan produk dengan prediksi tertinggi",
+            "Menjawab tanggal dan periode prediksi terbaru",
             "Menampilkan produk dengan stok rendah",
-            "Menjelaskan model Multiple Linear Regression"
+            "Menjelaskan alasan penggunaan Multiple Linear Regression",
+            "Menjawab informasi pencipta AI FloraPredict"
         ]
     }
 
@@ -429,6 +735,42 @@ def chat():
                 "intent": intent,
                 "answer": manual_answer,
                 "source": "manual_low_stock"
+            })
+
+        if intent == "creator_info":
+            return jsonify({
+                "success": True,
+                "question": message,
+                "intent": intent,
+                "answer": manual_answer,
+                "source": "manual_creator_info"
+            })
+
+        if intent == "latest_prediction_date":
+            return jsonify({
+                "success": True,
+                "question": message,
+                "intent": intent,
+                "answer": manual_answer,
+                "source": "manual_latest_prediction_date"
+            })
+
+        if intent == "latest_prediction_reason":
+            return jsonify({
+                "success": True,
+                "question": message,
+                "intent": intent,
+                "answer": manual_answer,
+                "source": "manual_latest_prediction_reason"
+            })
+
+        if intent in ["model_explanation", "why_not_simple_linear_regression", "why_not_complex_model"]:
+            return jsonify({
+                "success": True,
+                "question": message,
+                "intent": intent,
+                "answer": manual_answer,
+                "source": "manual_model_explanation"
             })
 
         answer_source = "gemini"
